@@ -1,0 +1,268 @@
+"""
+Standalone DeepSeek V3.2 tool parser.
+Ported from vllm/tool_parsers/deepseekv32_tool_parser.py with vllm dependencies removed.
+
+Parses DSML (DeepSeek Markup Language) tool call format:
+    <｜DSML｜function_calls>
+    <｜DSML｜invoke name="get_weather">
+    <｜DSML｜parameter name="location" string="true">value</｜DSML｜parameter>
+    </｜DSML｜invoke>
+    </｜DSML｜function_calls>
+
+Note: ｜ is fullwidth U+FF5C, not ASCII pipe.
+"""
+
+import json
+import logging
+import re
+import uuid
+from collections.abc import Sequence
+from typing import Any
+
+from tool_types import (
+    DeltaFunctionCall,
+    DeltaMessage,
+    DeltaToolCall,
+    ExtractedToolCallInformation,
+    FunctionCall,
+    ToolCall,
+    ToolParser,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class DeepSeekV32ToolParser(ToolParser):
+
+    # Whether the proxy should decode with skip_special_tokens=False
+    # when this parser is active and tools are present.
+    requires_no_skip_special_tokens: bool = True
+
+    def __init__(self, tokenizer: Any, tools: list[dict] | None = None):
+        super().__init__(tokenizer, tools)
+
+        self.prev_tool_call_arr: list[dict] = []
+
+        # Sentinel token (fullwidth pipes)
+        self.tool_call_start_token: str = "<\uff5cDSML\uff5cfunction_calls>"
+
+        # Streaming state
+        self.is_tool_call_started: bool = False
+        self.current_tool_index: int = 0
+
+        # Regex patterns for complete parsing
+        self.tool_call_complete_regex = re.compile(
+            r"<\uff5cDSML\uff5cfunction_calls>(.*?)</\uff5cDSML\uff5cfunction_calls>",
+            re.DOTALL,
+        )
+        self.invoke_complete_regex = re.compile(
+            r'<\uff5cDSML\uff5cinvoke\s+name="([^"]+)"\s*>(.*?)</\uff5cDSML\uff5cinvoke>',
+            re.DOTALL,
+        )
+        self.parameter_complete_regex = re.compile(
+            r'<\uff5cDSML\uff5cparameter\s+name="([^"]+)"\s+string="(?:true|false)"\s*>(.*?)</\uff5cDSML\uff5cparameter>',
+            re.DOTALL,
+        )
+
+        if not self.model_tokenizer:
+            raise ValueError(
+                "The model tokenizer must be passed to the ToolParser "
+                "constructor during construction."
+            )
+
+    def _generate_tool_call_id(self) -> str:
+        return f"call_{uuid.uuid4().hex[:24]}"
+
+    def _parse_invoke_params(self, invoke_str: str) -> dict:
+        param_dict = dict()
+        for param_name, param_val in self.parameter_complete_regex.findall(invoke_str):
+            param_dict[param_name] = param_val
+        return param_dict
+
+    def _convert_param_value_checked(self, value: str, param_type: str) -> Any:
+        if value.lower() == "null":
+            return None
+
+        param_type = param_type.lower()
+        if param_type in ["string", "str", "text"]:
+            return value
+        elif param_type in ["integer", "int"]:
+            return int(value)
+        elif param_type in ["number", "float"]:
+            val = float(value)
+            return val if val != int(val) else int(val)
+        elif param_type in ["boolean", "bool"]:
+            value = value.strip()
+            if value.lower() not in ["false", "0", "true", "1"]:
+                raise ValueError("Invalid boolean value")
+            return value.lower() in ["true", "1"]
+        elif param_type in ["object", "array"]:
+            return json.loads(value)
+        else:
+            return json.loads(value)
+
+    def _convert_param_value(self, value: str, param_type: str | list[str]) -> Any:
+        if not isinstance(param_type, list):
+            param_type = [param_type]
+        for current_type in param_type:
+            try:
+                return self._convert_param_value_checked(value, current_type)
+            except Exception:
+                continue
+        return value
+
+    def _convert_params_with_schema(
+        self,
+        function_name: str,
+        param_dict: dict[str, str],
+    ) -> dict[str, Any]:
+        """Convert raw string param values using the tool schema types."""
+        param_config: dict = {}
+        if self.tools:
+            for tool in self.tools:
+                if not isinstance(tool, dict):
+                    continue
+                func = tool.get("function", {})
+                if func.get("name") != function_name:
+                    continue
+                schema = func.get("parameters", {})
+                if isinstance(schema, dict) and "properties" in schema:
+                    param_config = schema["properties"]
+                break
+
+        converted: dict[str, Any] = {}
+        for name, value in param_dict.items():
+            param_type = "string"
+            if name in param_config and isinstance(param_config[name], dict):
+                param_type = param_config[name].get("type", "string")
+            converted[name] = self._convert_param_value(value, param_type)
+        return converted
+
+    def extract_tool_calls(
+        self,
+        model_output: str,
+        request: Any,
+    ) -> ExtractedToolCallInformation:
+        if self.tool_call_start_token not in model_output:
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+
+        try:
+            tool_calls = []
+
+            for tool_call_match in self.tool_call_complete_regex.findall(model_output):
+                for invoke_name, invoke_content in self.invoke_complete_regex.findall(
+                    tool_call_match
+                ):
+                    param_dict = self._parse_invoke_params(invoke_content)
+                    converted = self._convert_params_with_schema(
+                        invoke_name, param_dict
+                    )
+                    tool_calls.append(
+                        ToolCall(
+                            type="function",
+                            function=FunctionCall(
+                                name=invoke_name,
+                                arguments=json.dumps(
+                                    converted, ensure_ascii=False
+                                ),
+                            ),
+                        )
+                    )
+
+            if not tool_calls:
+                return ExtractedToolCallInformation(
+                    tools_called=False, tool_calls=[], content=model_output
+                )
+
+            first_tool_idx = model_output.find(self.tool_call_start_token)
+            content = model_output[:first_tool_idx] if first_tool_idx > 0 else None
+
+            return ExtractedToolCallInformation(
+                tools_called=True, tool_calls=tool_calls, content=content
+            )
+
+        except Exception:
+            logger.exception("Error extracting tool calls")
+            return ExtractedToolCallInformation(
+                tools_called=False, tool_calls=[], content=model_output
+            )
+
+    def _reset_streaming_state(self):
+        self.current_tool_index = 0
+        self.is_tool_call_started = False
+        self.prev_tool_call_arr.clear()
+        self.streamed_args_for_tool.clear()
+
+    def _extract_delta_tool_calls(
+        self,
+        current_text: str,
+        request: Any,
+    ) -> list[DeltaToolCall]:
+        complete_invokes = self.invoke_complete_regex.findall(current_text)
+        delta_tool_calls: list[DeltaToolCall] = []
+
+        while len(complete_invokes) > self.current_tool_index:
+            invoke_name, invoke_body = complete_invokes[self.current_tool_index]
+            param_dict = self._parse_invoke_params(invoke_body)
+
+            converted = self._convert_params_with_schema(invoke_name, param_dict)
+            args_json = json.dumps(converted, ensure_ascii=False)
+            idx = self.current_tool_index
+            self.current_tool_index += 1
+
+            self.prev_tool_call_arr.append(
+                {"name": invoke_name, "arguments": converted}
+            )
+            self.streamed_args_for_tool.append(args_json)
+
+            delta_tool_calls.append(
+                DeltaToolCall(
+                    index=idx,
+                    id=self._generate_tool_call_id(),
+                    function=DeltaFunctionCall(
+                        name=invoke_name,
+                        arguments=args_json,
+                    ),
+                    type="function",
+                )
+            )
+
+        return delta_tool_calls
+
+    def extract_tool_calls_streaming(
+        self,
+        previous_text: str,
+        current_text: str,
+        delta_text: str,
+        previous_token_ids: Sequence[int],
+        current_token_ids: Sequence[int],
+        delta_token_ids: Sequence[int],
+        request: Any,
+    ) -> DeltaMessage | None:
+        if not previous_text:
+            self._reset_streaming_state()
+
+        content_before = None
+        if self.is_tool_call_started:
+            pass
+        elif self.tool_call_start_token in current_text:
+            self.is_tool_call_started = True
+            start_idx = current_text.index(self.tool_call_start_token)
+            content_before = current_text[len(previous_text) : start_idx] or None
+        else:
+            return DeltaMessage(content=delta_text) if delta_text else None
+
+        delta_tool_calls = self._extract_delta_tool_calls(current_text, request)
+
+        if delta_tool_calls or content_before:
+            return DeltaMessage(
+                content=content_before,
+                tool_calls=delta_tool_calls,
+            )
+
+        if not delta_text and delta_token_ids and self.prev_tool_call_arr:
+            return DeltaMessage(content="")
+
+        return None
