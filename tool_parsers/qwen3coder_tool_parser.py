@@ -17,9 +17,10 @@ import logging
 import re
 import uuid
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Optional, Tuple, Dict, List
+from typing import override
 
-from tool_types import (
+from .tool_types import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -33,6 +34,9 @@ logger = logging.getLogger(__name__)
 
 
 class Qwen3CoderToolParser(ToolParser):
+
+    supports_reasoning = False
+
     def __init__(self, tokenizer: Any, tools: list[dict] | None = None):
         super().__init__(tokenizer, tools)
 
@@ -82,6 +86,16 @@ class Qwen3CoderToolParser(ToolParser):
                 "Qwen3 Coder Tool parser could not locate tool call start/end "
                 "tokens in the tokenizer!"
             )
+
+    def init_reasoning(self, prompt: str) -> None:
+        self._no_reasoning_prev_len = 0
+        if not self.supports_reasoning:
+            self._reasoning_parser = None
+            return
+
+        from .reasoning_parser import ReasoningParser
+        starts_in_think = prompt.endswith("<think>\n")
+        self._reasoning_parser = ReasoningParser(starts_in_think=starts_in_think)
 
     def _generate_tool_call_id(self) -> str:
         return f"call_{uuid.uuid4().hex[:24]}"
@@ -255,6 +269,10 @@ class Qwen3CoderToolParser(ToolParser):
         model_output: str,
         request: Any,
     ) -> ExtractedToolCallInformation:
+        # NOTE: hard-code for Qwen3 Coder/Qwen 3.5 format
+        # if "<think>\n" not in model_output and "\n</think>" in model_output:
+        #     model_output = "<think>\n" + model_output
+
         if self.tool_call_prefix not in model_output:
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
@@ -297,6 +315,29 @@ class Qwen3CoderToolParser(ToolParser):
             return ExtractedToolCallInformation(
                 tools_called=False, tool_calls=[], content=model_output
             )
+
+    @override
+    def post_process_content(self, content: str):
+        # Hard-code for Qwen3 Coder/Qwen 3.5 which does not have reasoning extraction support.
+        if not content.startswith("<think>\n") and "\n</think>" in content:
+            content = "<think>\n" + content
+
+    # @override
+    # def process_reasoning_delta(self, full_text: str) -> Tuple[Optional[str], Optional[str]]:
+    #     # Hard-code for Qwen3 Coder/Qwen 3.5 which does not have reasoning extraction support.
+    #     # if not full_text.startswith("<think>\n"):
+    #     #     full_text = "<think>\n" + full_text
+
+    #     # This model does not support reasoning extraction
+    #     delta = full_text[self._no_reasoning_prev_len :]
+    #     self._no_reasoning_prev_len = len(full_text)
+    #     return None, delta if delta else None
+
+    # @override
+    # def extract_reasoning(self, text: str) -> Tuple[Optional[str], str]:
+    #     # if not text.startswith("<think>\n"):
+    #     #     text = "<think>\n" + text
+    #     return None, text
 
     def extract_tool_calls_streaming(
         self,

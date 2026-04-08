@@ -6,8 +6,8 @@ Uses a mock tokenizer to avoid HuggingFace model downloads.
 import json
 import pytest
 
-from qwen3coder_tool_parser import Qwen3CoderToolParser
-from tool_types import DeltaMessage
+from tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
+from tool_parsers.tool_types import DeltaMessage
 
 
 # ---------------------------------------------------------------------------

@@ -3,6 +3,7 @@
 2. client是一个agent，会与sglang进行多轮交互，代码中把一条trajectory中所有的样本存下来，token_id存parquet文件，文本存json文件；
 """
 
+import copy
 import json
 import logging
 import os
@@ -13,13 +14,12 @@ from urllib.parse import urlparse
 from typing import List, Dict, Any, AsyncGenerator
 
 import httpx
-import pandas as pd
 from fastapi import FastAPI, Request
 from fastapi.responses import Response, StreamingResponse
 from transformers import AutoTokenizer
 
-from global_types import Message, OpenAICompletionRequest, OpenAIChatRequest
-from tool_types import ToolParser
+from global_types import Message, OpenAICompletionRequest, OpenAIChatRequest, TrajectoryStore
+from tool_parsers.tool_types import ToolParser
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -34,8 +34,8 @@ JSON_PATH = None
 TOKENIZER = None
 TOOL_PARSER: ToolParser | None = None
 
-# ===== 内存缓存 trajectory =====
-trajectory_store: Dict[str, List[Dict[str, Any]]] = {}
+# ===== 单例 trajectory store =====
+trajectory_store: TrajectoryStore = None
 
 # ===== tokenizer =====
 def text_to_token_ids(text: str) -> List[int]:
@@ -47,8 +47,6 @@ def token_ids_to_text(token_ids: List[int], skip_special_tokens: bool = True) ->
 
 
 # ===== chat prompt 拼接 =====
-
-
 def _message_content_to_str(content) -> str:
     """将 Message.content 统一转为字符串，支持 str / None / 多模态列表。"""
     if content is None:
@@ -67,22 +65,103 @@ def _message_content_to_str(content) -> str:
     return str(content)
 
 
-def build_chat_prompt(messages: List[Message], tools: List[Dict[str, Any]] | None = None) -> str:
+def _to_plain(obj):
+    """Recursively convert to plain Python dicts/lists (strip Pydantic models etc.)."""
+    if isinstance(obj, dict):
+        return {k: _to_plain(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_plain(v) for v in obj]
+    if hasattr(obj, 'model_dump'):
+        return _to_plain(obj.model_dump())
+    return obj
+
+
+def _normalize_tool_calls(tool_calls):
+    """Ensure tool_calls[].function.arguments is a dict, not a JSON string.
+
+    The OpenAI API returns arguments as a JSON string, but chat templates
+    (e.g. Qwen) expect a dict so they can call .items() on it.
+    """
+    result = _to_plain(tool_calls)
+    for tc in result:
+        func = tc.get("function", {})
+        args = func.get("arguments")
+        if isinstance(args, str):
+            try:
+                func["arguments"] = json.loads(args)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return result
+
+
+def build_chat_prompt(messages: List[Message], tools: List[Dict[str, Any]] | None = None, add_generation_prompt: bool = True) -> str:
     # 使用 tokenizer 自带 chat template（推荐）
     chat = []
     for m in messages:
-        msg = {"role": m.role, "content": _message_content_to_str(m.content)}
-        if m.name is not None:
-            msg["name"] = m.name
-        if m.tool_call_id is not None:
-            msg["tool_call_id"] = m.tool_call_id
-        if m.tool_calls is not None:
-            msg["tool_calls"] = m.tool_calls
-        chat.append(msg)
-    kwargs = dict(tokenize=False, add_generation_prompt=True)
+        if isinstance(m, Message):
+            msg = {"role": m.role, "content": _message_content_to_str(m.content)}
+            if m.reasoning_content is not None:
+                msg["reasoning_content"] = m.reasoning_content
+            if m.name is not None:
+                msg["name"] = m.name
+            if m.tool_call_id is not None:
+                msg["tool_call_id"] = m.tool_call_id
+            if m.tool_calls is not None:
+                msg["tool_calls"] = _normalize_tool_calls(m.tool_calls)
+            chat.append(msg)
+        else:
+            msg = {"role": m["role"], "content": _message_content_to_str(m["content"])}
+            if m.get("reasoning_content", None) is not None:
+                msg["reasoning_content"] = m.get("reasoning_content", None)
+            if m.get("name", None) is not None:
+                msg["name"] = m.get("name", None)
+            if m.get("tool_call_id", None) is not None:
+                msg["tool_call_id"] = m.get("tool_call_id", None)
+            if m.get("tool_calls", None) is not None:
+                msg["tool_calls"] = _normalize_tool_calls(m.get("tool_calls", None))
+            chat.append(msg)
+
+    kwargs = dict(tokenize=False, add_generation_prompt=add_generation_prompt)
     if tools:
-        kwargs["tools"] = tools
+        kwargs["tools"] = _to_plain(tools)
     return TOKENIZER.apply_chat_template(chat, **kwargs)
+
+
+# SGLang /generate 接口支持的 sampling_params 白名单
+# 不在此列表中的 OpenAI 额外字段（如 output_config）会被过滤掉
+SGLANG_SAMPLING_PARAM_KEYS = {
+    "max_tokens",
+    "max_new_tokens", 
+    "min_new_tokens",
+    "stop", 
+    "stop_token_ids",
+    "temperature", 
+    "top_p", 
+    "top_k",
+    "min_p", 
+    "frequency_penalty", 
+    "presence_penalty", 
+    "repetition_penalty",
+    "ignore_eos", 
+    "skip_special_tokens",
+    "spaces_between_special_tokens",
+    "regex", 
+    "json_schema", 
+    "ebnf",
+    "no_stop_trim",
+    "logit_bias",
+}
+
+
+def _filter_sampling_params(extra_params: Dict[str, Any] | None) -> Dict[str, Any]:
+    """从 extra_params 中只保留 SGLang sampling_params 支持的字段。"""
+    if not extra_params:
+        return {}
+    filtered = {k: v for k, v in extra_params.items() if k in SGLANG_SAMPLING_PARAM_KEYS}
+    dropped = set(extra_params) - set(filtered)
+    if dropped:
+        logger.warning(f"Dropped unsupported extra params: {dropped=}, {filtered=}")
+    return filtered
 
 
 # ===== sglang 调用 =====
@@ -127,9 +206,8 @@ async def call_sglang(
             stop = [stop]
         payload["sampling_params"]["stop"] = stop
 
-    # 透传额外参数到 sampling_params
-    if extra_params:
-        payload["sampling_params"].update(extra_params)
+    # 透传额外参数到 sampling_params（只保留 SGLang 支持的字段）
+    payload["sampling_params"].update(_filter_sampling_params(extra_params))
 
     async with httpx.AsyncClient(timeout=600) as client:
         resp = await client.post(SGLANG_URL, json=payload)
@@ -182,9 +260,8 @@ async def stream_sglang(
             stop = [stop]
         payload["sampling_params"]["stop"] = stop
 
-    # 透传额外参数
-    if extra_params:
-        payload.update(extra_params)
+    # 透传额外参数到 sampling_params（只保留 SGLang 支持的字段）
+    payload["sampling_params"].update(_filter_sampling_params(extra_params))
 
     async with httpx.AsyncClient(timeout=None) as client:
         async with client.stream("POST", SGLANG_URL, json=payload) as resp:
@@ -209,38 +286,13 @@ async def stream_sglang(
 
 # ===== 持久化 =====
 def save_trajectory():
-    rows = []
-    for traj_id, steps in trajectory_store.items():
-        for step_id, step in enumerate(steps):
-            rows.append(
-                {
-                    "trajectory_id": traj_id,
-                    "step": step_id,
-                }
-            )
+    traj_id = trajectory_store.traj_id
+    parquet_fp = os.path.join(PARQUET_PATH, f"{traj_id}.parquet")
+    jsonl_fp = os.path.join(JSON_PATH, f"{traj_id}.jsonl")
+    trajectory_store.save_parquet(parquet_fp, TOKENIZER)
+    trajectory_store.save_jsonl(jsonl_fp)
+    logger.info("trajectory saved: traj_id=%s, agents=%d", traj_id, len(trajectory_store.agents))
 
-    if rows:
-        parquet_target_fp = os.path.join(PARQUET_PATH, "tokens.parquet")
-        df = pd.DataFrame(rows)
-        df.to_parquet(parquet_target_fp, index=False)
-
-    json_target_fp = os.path.join(JSON_PATH, "text.json")
-    with open(json_target_fp, "w", encoding="utf-8") as f:
-        json.dump(trajectory_store, f, ensure_ascii=False, indent=2)
-    logger.info("trajectory saved: %d trajectories", len(trajectory_store))
-
-
-# ===== trajectory 管理 =====
-def get_or_create_trajectory(request: Request) -> str:
-    traj_id = request.headers.get("X-Trajectory-Id")
-
-    if not traj_id:
-        traj_id = str(uuid.uuid4())
-
-    if traj_id not in trajectory_store:
-        trajectory_store[traj_id] = []
-
-    return traj_id
 
 
 # ===== SSE 工具 =====
@@ -269,7 +321,7 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
     if body.echo:
         logger.warning("OpenAICompletionRequest: echo is not supported")
 
-    traj_id = get_or_create_trajectory(request)
+    store = trajectory_store
 
     # prompt 可以是 str / List[str] / List[int]（token IDs）/ List[List[int]]
     prompt = body.prompt
@@ -294,6 +346,7 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
 
     if body.stream:
         cmpl_id = f"cmpl-{uuid.uuid4().hex}"
+        created_ts = int(time.time())
 
         async def generator():
             full_ids = []
@@ -311,7 +364,7 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
                 extra_params=body.model_extra,
             ):
                 full_ids = ids
-                text = token_ids_to_text(ids)
+                text = token_ids_to_text(ids).rstrip('\ufffd')
                 delta = text[len(prev_text) :]
                 prev_text = text
                 if delta:
@@ -319,6 +372,8 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
                         {
                             "id": cmpl_id,
                             "object": "text_completion",
+                            "created": created_ts,
+                            "model": body.model,
                             "choices": [
                                 {"text": delta, "index": 0, "finish_reason": None}
                             ],
@@ -330,16 +385,17 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
                 {
                     "id": cmpl_id,
                     "object": "text_completion",
+                    "created": created_ts,
+                    "model": body.model,
                     "choices": [{"text": "", "index": 0, "finish_reason": "stop"}],
                 }
             )
 
-            trajectory_store[traj_id].append(
-                {
-                    "input_text": prompt,
-                    "output_text": prev_text,
-                }
-            )
+            # Completions are not multi-turn; create a new agent per request
+            synthetic_msgs = [{"role": "user", "content": prompt}]
+            response_msg = {"role": "assistant", "content": prev_text}
+            agent = store.find_or_create_agent(synthetic_msgs, body.tools)
+            agent.append_turn(synthetic_msgs, response_msg, input_ids, full_ids)
             save_trajectory()
 
             yield "data: [DONE]\n\n"
@@ -362,12 +418,10 @@ async def proxy_completion(request: Request, body: OpenAICompletionRequest):
     output_ids = sglang_resp.get("output_ids") or sglang_resp.get("token_ids", [])
     output_text = token_ids_to_text(output_ids)
 
-    trajectory_store[traj_id].append(
-        {
-            "input_text": prompt,
-            "output_text": output_text,
-        }
-    )
+    synthetic_msgs = [{"role": "user", "content": prompt}]
+    response_msg = {"role": "assistant", "content": output_text}
+    agent = store.find_or_create_agent(synthetic_msgs, body.tools)
+    agent.append_turn(synthetic_msgs, response_msg, input_ids, output_ids)
     save_trajectory()
 
     return {
@@ -403,10 +457,21 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
     if body.function_call is not None:
         logger.warning("OpenAIChatRequest: function_call (legacy) is not supported")
 
-    traj_id = get_or_create_trajectory(request)
+    store = trajectory_store
+    incoming_msgs = [m.model_dump() for m in body.messages]
+    agent = store.get_agent(incoming_msgs, body.tools)
 
-    prompt = build_chat_prompt(body.messages, tools=body.tools)
-    input_ids = text_to_token_ids(prompt)
+    if agent is not None and agent.messages and agent.prompt_token_ids and agent.response_token_ids:
+        prompt = build_chat_prompt(body.messages, tools=body.tools)
+        input_ids = text_to_token_ids(prompt)
+        prompt_prefix = build_chat_prompt(agent.messages, tools=body.tools, add_generation_prompt=False)
+        input_ids_prefix = text_to_token_ids(prompt_prefix)
+        tool_ids = input_ids[len(input_ids_prefix): ]
+        input_ids = agent.prompt_token_ids + agent.response_token_ids + tool_ids
+    else:
+        prompt = build_chat_prompt(body.messages, tools=body.tools)
+        input_ids = text_to_token_ids(prompt)
+        tool_ids = []
 
     # Determine whether to preserve special tokens for tool parsing
     skip_sp = not (
@@ -416,14 +481,51 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
     )
     use_tool_parser = TOOL_PARSER is not None and body.tools
 
+    # Create per-request tool parser copy to avoid concurrent state corruption
+    if TOOL_PARSER:
+        req_parser = copy.copy(TOOL_PARSER)
+        req_parser.prev_tool_call_arr = []
+        req_parser.streamed_args_for_tool = []
+        req_parser._reasoning_parser = None
+        req_parser._no_reasoning_prev_len = 0
+        if hasattr(req_parser, '_reset_streaming_state'):
+            req_parser._reset_streaming_state()
+        req_parser.init_reasoning(prompt)
+    else:
+        req_parser = None
+
     if body.stream:
         cmpl_id = f"chatcmpl-{uuid.uuid4().hex}"
+        created_ts = int(time.time())
 
         async def generator():
             full_ids = []
             prev_text = ""
             prev_ids: List[int] = []
             has_tool_calls = False
+            # For tool parser: track content-only text (without reasoning block)
+            tool_prev_text = ""
+            tool_prev_ids: List[int] = []
+            # Track delta for no-parser fallback
+            no_parser_prev_len = 0
+
+            # OpenAI spec: first chunk must include role
+            yield sse_format(
+                {
+                    "id": cmpl_id,
+                    "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": body.model,
+                    "choices": [
+                        {
+                            "delta": {"role": "assistant"},
+                            "index": 0,
+                            "finish_reason": None,
+                        }
+                    ],
+                }
+            )
+
             async for ids in stream_sglang(
                 input_ids,
                 body.max_tokens,
@@ -437,60 +539,90 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
                 extra_params=body.model_extra,
             ):
                 full_ids = ids
-                text = token_ids_to_text(ids, skip_special_tokens=skip_sp)
-                delta = text[len(prev_text) :]
+                text = token_ids_to_text(ids, skip_special_tokens=skip_sp).rstrip('\ufffd')
                 delta_ids = ids[len(prev_ids):]
 
-                if use_tool_parser and TOOL_PARSER:
-                    msg = TOOL_PARSER.extract_tool_calls_streaming(
-                        previous_text=prev_text,
-                        current_text=text,
-                        delta_text=delta,
-                        previous_token_ids=prev_ids,
-                        current_token_ids=ids,
-                        delta_token_ids=delta_ids,
-                        request=body,
-                    )
-                    prev_text = text
-                    prev_ids = list(ids)
-
-                    if msg is None:
-                        continue
-
-                    chunk_delta: Dict[str, Any] = {}
-                    if msg.content:
-                        chunk_delta["content"] = msg.content
-                    if msg.tool_calls:
-                        has_tool_calls = True
-                        chunk_delta["tool_calls"] = [
-                            tc.model_dump(exclude_none=True) for tc in msg.tool_calls
-                        ]
-
-                    if chunk_delta:
-                        yield sse_format(
-                            {
-                                "id": cmpl_id,
-                                "object": "chat.completion.chunk",
-                                "choices": [
-                                    {
-                                        "delta": chunk_delta,
-                                        "index": 0,
-                                        "finish_reason": None,
-                                    }
-                                ],
-                            }
-                        )
+                # Extract reasoning vs content via tool parser
+                if req_parser:
+                    reasoning_delta, content_delta = req_parser.process_reasoning_delta(text)
                 else:
-                    prev_text = text
-                    prev_ids = list(ids)
-                    if delta:
+                    reasoning_delta = None
+                    content_delta = text[no_parser_prev_len:]
+                    no_parser_prev_len = len(text)
+                    content_delta = content_delta if content_delta else None
+
+                prev_text = text
+                prev_ids = list(ids)
+
+                # Emit reasoning_content delta
+                if reasoning_delta:
+                    yield sse_format(
+                        {
+                            "id": cmpl_id,
+                            "object": "chat.completion.chunk",
+                            "created": created_ts,
+                            "model": body.model,
+                            "choices": [
+                                {
+                                    "delta": {"reasoning_content": reasoning_delta},
+                                    "index": 0,
+                                    "finish_reason": None,
+                                }
+                            ],
+                        }
+                    )
+
+                # Emit content delta (with or without tool parsing)
+                if content_delta:
+                    if use_tool_parser and req_parser:
+                        content_text = req_parser.get_content_text(text)
+                        msg = req_parser.extract_tool_calls_streaming(
+                            previous_text=tool_prev_text,
+                            current_text=content_text,
+                            delta_text=content_delta,
+                            previous_token_ids=tool_prev_ids,
+                            current_token_ids=ids,
+                            delta_token_ids=delta_ids,
+                            request=body,
+                        )
+                        tool_prev_text = content_text
+                        tool_prev_ids = list(ids)
+
+                        if msg is not None:
+                            chunk_delta: Dict[str, Any] = {}
+                            if msg.content:
+                                chunk_delta["content"] = msg.content
+                            if msg.tool_calls:
+                                has_tool_calls = True
+                                chunk_delta["tool_calls"] = [
+                                    tc.model_dump(exclude_none=True) for tc in msg.tool_calls
+                                ]
+                            if chunk_delta:
+                                yield sse_format(
+                                    {
+                                        "id": cmpl_id,
+                                        "object": "chat.completion.chunk",
+                                        "created": created_ts,
+                                        "model": body.model,
+                                        "choices": [
+                                            {
+                                                "delta": chunk_delta,
+                                                "index": 0,
+                                                "finish_reason": None,
+                                            }
+                                        ],
+                                    }
+                                )
+                    else:
                         yield sse_format(
                             {
                                 "id": cmpl_id,
                                 "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": body.model,
                                 "choices": [
                                     {
-                                        "delta": {"content": delta},
+                                        "delta": {"content": content_delta},
                                         "index": 0,
                                         "finish_reason": None,
                                     }
@@ -504,6 +636,8 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
                 {
                     "id": cmpl_id,
                     "object": "chat.completion.chunk",
+                    "created": created_ts,
+                    "model": body.model,
                     "choices": [
                         {
                             "delta": {},
@@ -514,14 +648,31 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
                 }
             )
 
-            trajectory_store[traj_id].append(
-                {
-                    "input_text": prompt,
-                    "output_text": prev_text,
-                    "messages": [m.model_dump() for m in body.messages],
-                }
-            )
-            save_trajectory()
+            # Build response message for trajectory storage
+            incoming_msgs = [m.model_dump() for m in body.messages]
+            if req_parser and body.tools:
+                reasoning_text, content_text = req_parser.extract_reasoning(prev_text)
+                extracted = req_parser.extract_tool_calls(content_text, body)
+                if extracted.tools_called and extracted.tool_calls:
+                    content_text = extracted.content
+                    tool_calls = [
+                        tc.model_dump() for tc in extracted.tool_calls
+                    ]
+                else:
+                    tool_calls = None
+
+                # NOTE: only save agent when tools are involved, excluding title naming agent
+                # content_text = req_parser.post_process_content(content_text)
+                response_msg: Dict[str, Any] = {"role": "assistant", "content": content_text}
+                if reasoning_text is not None:
+                    response_msg["reasoning_content"] = reasoning_text
+                if tool_calls:
+                    response_msg["tool_calls"] = tool_calls
+
+                incoming_msgs = [m.model_dump() for m in body.messages]
+                agent = store.find_or_create_agent(incoming_msgs, body.tools)
+                agent.append_turn(incoming_msgs, response_msg, input_ids, full_ids, tool_ids)
+                save_trajectory()
 
             yield "data: [DONE]\n\n"
 
@@ -550,29 +701,31 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
     output_ids = sglang_resp.get("output_ids") or sglang_resp.get("token_ids", [])
     output_text = token_ids_to_text(output_ids, skip_special_tokens=skip_sp)
 
-    trajectory_store[traj_id].append(
-        {
-            "input_text": prompt,
-            "output_text": output_text,
-            "input_ids": input_ids,
-            "output_ids": output_ids,
-            "messages": [m.model_dump() for m in body.messages],
-        }
-    )
-    save_trajectory()
+    # Extract reasoning content (handled by tool parser)
+    if req_parser:
+        reasoning_content, content_text = req_parser.extract_reasoning(output_text)
+    else:
+        reasoning_content, content_text = None, output_text
 
-    # Try to extract tool calls from model output
-    message: Dict[str, Any] = {"role": "assistant", "content": output_text}
+    # Try to extract tool calls from content (reasoning already stripped)
+    message: Dict[str, Any] = {"role": "assistant", "content": content_text}
+    if reasoning_content is not None:
+        message["reasoning_content"] = reasoning_content
     finish_reason = "stop"
 
-    if TOOL_PARSER and body.tools:
-        extracted = TOOL_PARSER.extract_tool_calls(output_text, body)
+    if req_parser and body.tools:
+        extracted = req_parser.extract_tool_calls(content_text, body)
         if extracted.tools_called and extracted.tool_calls:
             finish_reason = "tool_calls"
             message["content"] = extracted.content
             message["tool_calls"] = [
                 tc.model_dump() for tc in extracted.tool_calls
             ]
+
+    # content_text_post = req_parser.post_process_content(message["content"])
+    # message["content"] = content_text_post
+    agent.append_turn(incoming_msgs, message, input_ids, output_ids, tool_ids)
+    save_trajectory()
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex}",
@@ -645,7 +798,7 @@ def parse_args():
 
 
 def init_globals(args):
-    global SGLANG_URL, SGLANG_BASE_URL, PARQUET_PATH, JSON_PATH, TOKENIZER, TOOL_PARSER
+    global SGLANG_URL, SGLANG_BASE_URL, PARQUET_PATH, JSON_PATH, TOKENIZER, TOOL_PARSER, trajectory_store
     SGLANG_BASE_URL = args.sglang_base_url
     SGLANG_URL = f"{SGLANG_BASE_URL}/generate"
     PARQUET_PATH = args.parquet_path
@@ -653,26 +806,28 @@ def init_globals(args):
 
     # 确保数据目录存在
     for path in [PARQUET_PATH, JSON_PATH]:
-        dirname = os.path.dirname(os.path.abspath(path))
-        os.makedirs(dirname, exist_ok=True)
+        os.makedirs(path, exist_ok=True)
 
     logger.info("Loading tokenizer from %s ...", args.tokenizer_path)
     TOKENIZER = AutoTokenizer.from_pretrained(
         args.tokenizer_path, trust_remote_code=True
     )
+    trajectory_store = TrajectoryStore()
     logger.info("SGLang URL: %s, base: %s", SGLANG_URL, SGLANG_BASE_URL)
+    logger.info("Trajectory store initialized: traj_id=%s", trajectory_store.traj_id)
 
     # Initialize tool parser
     tool_parser_name = getattr(args, "tool_parser", None)
     if tool_parser_name == "qwen3_coder":
-        from qwen3coder_tool_parser import Qwen3CoderToolParser
+        from tool_parsers.qwen3coder_tool_parser import Qwen3CoderToolParser
         TOOL_PARSER = Qwen3CoderToolParser(TOKENIZER)
         logger.info("Tool parser: Qwen3CoderToolParser")
     elif tool_parser_name == "deepseek_v32":
-        from deepseekv32_tool_parser import DeepSeekV32ToolParser
+        from tool_parsers.deepseekv32_tool_parser import DeepSeekV32ToolParser
         TOOL_PARSER = DeepSeekV32ToolParser(TOKENIZER)
         logger.info("Tool parser: DeepSeekV32ToolParser")
     else:
+        logger.warning(f"Tool parser must be defined: {tool_parser_name=}")
         TOOL_PARSER = None
 
 

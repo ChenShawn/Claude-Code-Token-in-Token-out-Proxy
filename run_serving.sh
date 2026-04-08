@@ -2,8 +2,12 @@
 
 # MODEL_PATH=/diancpfs/user/fengyuan/backbones/DeepSeek-V3.2
 MODEL_PATH=/diancpfs/user/fengyuan/backbones/Qwen/Qwen3.5-35B-A3B
-SGLANG_BASE_URL=http://10.146.228.161:18901
+SGLANG_BASE_URL=http://10.146.225.70:18901
 TOOL_PARSER=qwen3_coder
+# TOOL_PARSER=deepseek_v32
+
+make clean
+mkdir -p ./log
 
 set -x
 python proxy_serving.py \
@@ -11,4 +15,4 @@ python proxy_serving.py \
     --tokenizer-path ${MODEL_PATH} \
     --tool-parser ${TOOL_PARSER} \
     --host 0.0.0.0 \
-    --port 18901
+    --port 18901 2>&1 | tee ./log/proxy.log

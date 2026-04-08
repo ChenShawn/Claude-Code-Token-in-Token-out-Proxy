@@ -1,6 +1,13 @@
+import json
 import uuid
+import logging
+from datetime import datetime
 from pydantic import BaseModel
 from typing import List, Dict, Any, AsyncGenerator, Optional, Union
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 
 # ===== 数据结构 =====
@@ -79,35 +86,173 @@ class OpenAIChatRequest(BaseModel):
 
 
 # ======= 存储结构 =======
-class AgentTrajectory:
-    def __init__(self, agent_id: str = None):
-        self.agent_id = agent_id or str(uuid.uuid4())
-        self.prompt_token_ids = []
-        self.response_token_ids = []
-        self.messages = []
 
-    def to_json(self):
-        return {
+
+def _normalize_message_for_comparison(msg: Dict[str, Any]) -> tuple:
+    """Normalize a message dict to a comparable tuple for prefix matching."""
+    role = msg.get("role", "")
+    content = msg.get("content")
+    if content is None:
+        content = ""
+    elif isinstance(content, list):
+        # Multi-modal content: extract text parts
+        parts = []
+        if isinstance(content, str):
+            parts.append(content)
+        else:
+            for item in content:
+                if isinstance(item, dict) and item.get("type") == "text":
+                    parts.append(item.get("text", ""))
+                elif isinstance(item, str):
+                    parts.append(item)
+        content = "\n\n".join(parts)
+    tool_call_id = msg.get("tool_call_id", "")
+    tool_calls = msg.get("tool_calls")
+    tool_calls_key = json.dumps(tool_calls, sort_keys=True) if tool_calls else ""
+    # return (role, content, tool_call_id, tool_calls_key)
+    return (role, content)
+
+
+def _count_segments(arr):
+    if not arr:
+        return 0
+    count = 1
+    for i in range(1, len(arr)):
+        if arr[i] != arr[i - 1]:
+            count += 1
+    return count
+
+
+class AgentTrajectory:
+    def __init__(self, agent_id: str = None, input_tools: Optional[List[Dict[str, Any]]] = None):
+        self.agent_id = agent_id or str(uuid.uuid4())
+        self.messages: List[Dict[str, Any]] = []  # Full conversation history (OpenAI format)
+        self.prompt_token_ids: List[int] = []  # Per-turn input token IDs
+        self.response_token_ids: List[int] = []  # Per-turn output token IDs
+        self.response_mask: List[int] = []
+
+        self.create_time = datetime.now().isoformat()
+        self.update_time = datetime.now().isoformat()
+        self.tools = input_tools
+
+    def matches_prefix(self, incoming_messages: List[Dict[str, Any]]) -> bool:
+        """Return True if self.messages is a non-empty prefix of incoming_messages."""
+        if not self.messages:
+            return False
+        if len(self.messages) > len(incoming_messages):
+            return False
+        if incoming_messages and incoming_messages[-1].get("role", "") == "user":
+            return False
+
+        for stored, incoming in zip(self.messages, incoming_messages):
+            stored_norm = _normalize_message_for_comparison(stored)
+            incoming_norm = _normalize_message_for_comparison(incoming)
+            if stored_norm != incoming_norm:
+                logger.debug(f"Prefix mismatch for agent {self.agent_id}:\n[STORED]\n{stored_norm}\n[IMCOMING]\n{incoming_norm}")
+                return False
+        return True
+
+    def append_turn(
+        self,
+        full_messages: List[Dict[str, Any]],
+        response_message: Dict[str, Any],
+        input_ids: List[int],
+        output_ids: List[int],
+        tool_ids: List[int] = [],
+        tokenizer = None
+    ):
+        """Append a new turn: update messages to full history + response, record token IDs."""
+        if self.prompt_token_ids and tool_ids:
+            # Tool tokens do not have token mismatch issue
+            self.response_token_ids.extend(tool_ids)
+            self.response_mask.extend([1] * len(tool_ids))
+        else:
+            self.prompt_token_ids.extend(input_ids)
+
+        self.messages = list(full_messages) + [response_message]
+        self.response_token_ids.extend(output_ids)
+        self.response_mask.extend([0] * len(output_ids))
+        self.update_time = datetime.now().isoformat()
+
+    def to_jsonl_dict(self) -> Dict[str, Any]:
+        """For JSONL export: agent_id + messages only, no token IDs."""
+        num_turns = _count_segments(self.response_mask)
+        retdata = {
             "agent_id": self.agent_id,
             "messages": self.messages,
-            "extra": {
-                "num_input_tokens": len(self.prompt_token_ids),
-                "num_output_tokens": len(self.response_token_ids),
+            "metadata": {
+                "num_turns": num_turns,
+                "total_prompt_tokens": len(self.prompt_token_ids),
+                "total_obs_tokens": sum(self.response_mask),
+                "total_resp_tokens": len(self.response_token_ids) - sum(self.response_mask),
+                "total_agent_tokens": len(self.response_token_ids),
+                "create_time": self.create_time,
+                "update_time": self.update_time,
             }
         }
+        if self.tools:
+            retdata["tools"] = self.tools
+        return retdata
 
-    def to_parquet_json(self):
-        return {
+    def to_parquet_dict(self, tokenizer=None) -> Dict[str, Any]:
+        """For parquet export: agent_id + messages + token IDs (as JSON strings)."""
+        retdata = {
             "agent_id": self.agent_id,
-            "num_input_tokens": len(self.prompt_token_ids),
-            "num_output_tokens": len(self.response_token_ids),
+            "prompt_token_ids": self.prompt_token_ids,
+            "response_token_ids": self.response_token_ids,
+            "response_mask": self.response_mask,
         }
+        if tokenizer:
+            prompt_text = tokenizer.decode(self.prompt_token_ids, skip_special_tokens=False)
+            response_text = tokenizer.decode(self.response_token_ids, skip_special_tokens=False)
+            retdata["prompt_text"] = prompt_text
+            retdata["response_text"] = response_text
+        return retdata
 
 
 class TrajectoryStore:
     def __init__(self, traj_id: str = None):
         self.traj_id = traj_id or str(uuid.uuid4())
-        self.trajectory_store = []
+        self.agents: List[AgentTrajectory] = []
 
-    def add_trajectory(self, trajectory: AgentTrajectory):
-        pass
+    def find_or_create_agent(
+        self, 
+        incoming_messages: List[Dict[str, Any]], 
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> AgentTrajectory:
+        """Find an agent whose messages are a prefix of incoming_messages, or create a new one."""
+        for agent in self.agents:
+            if agent.matches_prefix(incoming_messages):
+                return agent
+
+        new_agent = AgentTrajectory(agent_id=None, input_tools=tools)
+        self.agents.append(new_agent)
+        logger.info(
+            "traj %s: created new agent %s (total agents: %d)",
+            self.traj_id, new_agent.agent_id, len(self.agents),
+        )
+        return new_agent
+
+    def get_agent(
+        self, 
+        incoming_messages: List[Dict[str, Any]], 
+        tools: Optional[List[Dict[str, Any]]] = None
+    ) -> AgentTrajectory:
+        """Find an agent whose messages are a prefix of incoming_messages, or create a new one."""
+        for agent in self.agents:
+            if agent.matches_prefix(incoming_messages):
+                return agent
+        return None
+
+    def save_jsonl(self, path: str):
+        """Export to JSONL: one line per agent, messages only, ordered."""
+        with open(path, "w", encoding="utf-8") as f:
+            for agent in self.agents:
+                f.write(json.dumps(agent.to_jsonl_dict(), ensure_ascii=False) + "\n")
+
+    def save_parquet(self, path: str, tokenizer=None):
+        """Export to parquet: one row per agent, with messages and token IDs, ordered."""
+        rows = [agent.to_parquet_dict(tokenizer) for agent in self.agents]
+        if rows:
+            df = pd.DataFrame(rows)
+            df.to_parquet(path, index=False)

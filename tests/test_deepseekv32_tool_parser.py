@@ -13,8 +13,8 @@ DSML format uses fullwidth pipes (U+FF5C):
 import json
 import pytest
 
-from deepseekv32_tool_parser import DeepSeekV32ToolParser
-from tool_types import DeltaMessage
+from tool_parsers.deepseekv32_tool_parser import DeepSeekV32ToolParser
+from tool_parsers.tool_types import DeltaMessage
 
 # Fullwidth pipe shorthand
 FP = "\uff5c"

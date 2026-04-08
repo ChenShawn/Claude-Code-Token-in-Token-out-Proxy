@@ -26,7 +26,12 @@ See `run_serving.sh` for a working example with real model paths.
 ## Architecture
 
 - **`proxy_serving.py`** — Single-file FastAPI app. All routing, SGLang communication (both streaming and non-streaming), trajectory storage, and the CLI entrypoint live here. Global state (`SGLANG_URL`, `TOKENIZER`, `trajectory_store`) is initialized via `init_globals()` from CLI args.
-- **`gtypes.py`** — Pydantic models for OpenAI API request/response types (`Message`, `OpenAICompletionRequest`, `OpenAIChatRequest`) plus trajectory storage classes (`AgentTrajectory`, `TrajectoryStore`). Models use `extra = "allow"` to pass through unknown fields.
+- **`global_types.py`** — Pydantic models for OpenAI API request/response types (`Message`, `OpenAICompletionRequest`, `OpenAIChatRequest`) plus trajectory storage classes (`AgentTrajectory`, `TrajectoryStore`). Models use `extra = "allow"` to pass through unknown fields.
+- **`tool_parsers/`** — Tool call parsing package. Contains:
+  - `tool_types.py` — Base data types (`ToolCall`, `DeltaToolCall`, `ExtractedToolCallInformation`, etc.) and abstract `ToolParser` class.
+  - `deepseekv32_tool_parser.py` — DeepSeek V3.2 DSML format parser.
+  - `qwen3coder_tool_parser.py` — Qwen3 Coder XML format parser.
+- **`tests/`** — Test files for tool parsers (`test_deepseekv32_tool_parser.py`, `test_qwen3coder_tool_parser.py`).
 - **`data/`** — Output directory for trajectory data (`tokens.parquet`, `text.json`).
 
 ## Key Design Decisions

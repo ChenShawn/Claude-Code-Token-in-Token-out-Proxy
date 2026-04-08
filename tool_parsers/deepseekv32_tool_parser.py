@@ -19,7 +19,7 @@ import uuid
 from collections.abc import Sequence
 from typing import Any
 
-from tool_types import (
+from .tool_types import (
     DeltaFunctionCall,
     DeltaMessage,
     DeltaToolCall,
@@ -36,7 +36,7 @@ class DeepSeekV32ToolParser(ToolParser):
 
     # Whether the proxy should decode with skip_special_tokens=False
     # when this parser is active and tools are present.
-    requires_no_skip_special_tokens: bool = True
+    requires_no_skip_special_tokens: bool = False
 
     def __init__(self, tokenizer: Any, tools: list[dict] | None = None):
         super().__init__(tokenizer, tools)
