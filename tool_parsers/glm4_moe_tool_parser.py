@@ -81,6 +81,20 @@ class Glm4MoeToolParser(ToolParser):
         self._args_closed: list[bool] = []
         self._seen_keys: list[set[str]] = []
 
+    def _reset_streaming_state(self) -> None:
+        """Reset all mutable streaming state for per-request copies."""
+        self._buffer = ""
+        self._in_tool_call = False
+        self._current_tool_name = None
+        self._pending_key = None
+        self._streaming_string_value = False
+        self._tool_call_ids = []
+        self._args_started = []
+        self._args_closed = []
+        self._seen_keys = []
+        self.current_tool_id = -1
+        self.current_tool_name_sent = False
+
     # ---- Static helpers ----
 
     @staticmethod

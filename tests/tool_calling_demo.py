@@ -5,6 +5,7 @@ client = OpenAI(
     api_key="EMPTY",
     # base_url="http://10.146.225.70:18901/v1",
     base_url="http://127.0.0.1:18901/v1",
+    # base_url="http://10.146.236.83:30000/v1",
 )
 
 # 定义工具

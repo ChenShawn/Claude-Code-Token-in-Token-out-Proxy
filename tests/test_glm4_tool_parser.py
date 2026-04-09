@@ -411,6 +411,44 @@ class TestGlm47ExtractToolCalls:
         assert result.tools_called is False
         assert result.content == "Just plain text."
 
+    def test_real_1(self, glm47_parser):
+        output = """The user wants me to analyze the codebase and create/improve a CLAUDE.md file. I can see from the git status that there's a `D CLAUDE.md` - the file was deleted. Let me first check what existed before and explore the codebase to understand the architecture and development practices.
+
+Let me start by reading existing configuration files and exploring the codebase structure.</think>I'll analyze the codebase to create an improved CLAUDE.md. Let me explore the key files in parallel.<tool_call>Agent<arg_key>description</arg_key><arg_value>Explore codebase architecture</arg_value><arg_key>subagent_type</arg_key><arg_value>Explore</arg_value><arg_key>prompt</arg_key><arg_value>Very thorough exploration of this vLLM codebase. I need to understand:
+
+1. The top-level directory structure (what are the main dirs)
+2. The V1 multi-process architecture - find docs about it
+3. Key configuration files: pyproject.toml, setup.py, setup.cfg, Makefile, AGENTS.md, .cursor/rules/, .cursorrules, .github/copilot-instructions.md
+4. The test infrastructure - how tests are organized, conftest.py files, test requirements
+5. The main package structure under vllm/
+6. How the build system works (C++/CUDA extensions)
+7. Pre-commit config (.pre-commit-config.yaml)
+8. Any CI/CD configuration
+9. The entrypoints and CLI structure
+10. The model executor architecture
+
+For each, read the actual file contents where possible. I need detailed information, not just file listings.</arg_value><arg_key>model</arg_key><arg_value>sonnet</arg_value><arg_key>run_in_background</arg_key><arg_value>true</arg_value></tool_call><|observation|><tool_call>Agent<arg_key>description</arg_key><arg_value>Find existing rules and docs</arg_value><arg_key>subagent_type</arg_key><arg_value>Explore</arg_value><arg_key>prompt</arg_key><arg_value>Search thoroughly for these files and read their contents:
+
+1. AGENTS.md - in root or any subdirectory
+2. .cursor/rules/ directory and any files within
+3. .cursorrules file
+4. .github/copilot-instructions.md
+5. CONTRIBUTING.md or docs/contributing/
+6. README.md
+7. Any docs/design/ files
+8. docs/contributing/editing-agent-instructions.md
+9. docs/contributing/model/README.md
+10. Any .editorconfig or similar files
+
+Read the full contents of each file found.</arg_value><arg_key>model</arg_key><arg_value>sonnet</arg_value><arg_key>run_in_background</arg_key><arg_value>true</arg_value></tool_call>"""
+        result = glm47_parser.extract_tool_calls(output, None)
+        assert result.tools_called is True
+        args0 = json.loads(result.tool_calls[0].function.arguments)
+        args1 = json.loads(result.tool_calls[1].function.arguments)
+        assert args0["model"] == "sonnet", f"{args0=}"
+        assert args0["subagent_type"] == "Explore", f"{args0=}"
+        assert args1["description"].strip() == "Find existing rules and docs", f"{args1=}"
+
 
 # ===================================================================
 # GLM-4: Streaming extract_tool_calls_streaming
@@ -846,6 +884,204 @@ class TestEdgeCases:
         result = glm4_parser.extract_tool_calls(output, None)
         args = json.loads(result.tool_calls[0].function.arguments)
         assert args["location"] == ""
+
+
+# ===================================================================
+# GLM-4.7 real-world case: Agent tool with multiline args
+# ===================================================================
+
+AGENT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "Agent",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "prompt": {"type": "string"},
+                "subagent_type": {"type": "string"},
+                "model": {"type": "string"},
+            },
+        },
+    },
+}
+
+GLM5_REAL_OUTPUT = (
+    "The user wants me to analyze the codebase and create/update a CLAUDE.md file."
+    " Let me first check what already exists"
+    " - I see from the git status that CLAUDE.md was deleted"
+    ' (status shows `D CLAUDE.md`).'
+    " Let me also check .claude/CLAUDE.md which appears to have content"
+    " based on the system reminder.\n\n"
+    "Let me look at the existing files and understand the codebase structure."
+    "</think>"
+    "I'll analyze the codebase to create a comprehensive CLAUDE.md."
+    " Let me explore the key files and structure first."
+    "<tool_call>Agent"
+    "<arg_key>description</arg_key>"
+    "<arg_value>Explore codebase architecture</arg_value>"
+    "<arg_key>prompt</arg_key>"
+    "<arg_value>Explore this vLLM codebase to understand its architecture"
+    " and development workflow. I need to create a CLAUDE.md file."
+    " Please investigate:\n\n"
+    "1. Look at the root-level files: AGENTS.md, README.md,"
+    " pyproject.toml, setup.py/setup.cfg if they exist\n"
+    "2. Check for any .cursor/rules/, .cursorrules,"
+    " .github/copilot-instructions.md files\n"
+    "3. Look at the top-level directory structure (vllm/, csrc/, tests/, docs/)\n"
+    "4. Check vllm/ subdirectory structure\n"
+    "5. Look at requirements/ directory for test dependencies\n"
+    "6. Check .pre-commit-config.yaml for linting setup\n"
+    "7. Look at docs/contributing/ for contribution guidelines\n"
+    "8. Check if there's a docs/design/arch_overview.md\n\n"
+    "Report back a detailed summary of what you find,"
+    " including key architectural patterns, build/test/lint commands,"
+    " and any rules or guidelines from cursor/copilot configs."
+    " Be thorough - this will inform the CLAUDE.md content."
+    "</arg_value>"
+    "<arg_key>subagent_type</arg_key>"
+    "<arg_value>Explore</arg_value>"
+    "<arg_key>model</arg_key>"
+    "<arg_value>sonnet</arg_value>"
+    "</tool_call>"
+)
+
+
+class TestGlm47RealWorld:
+    """Tests with real GLM-5.1 model output containing Agent tool calls."""
+
+    @pytest.fixture
+    def agent_parser(self):
+        return Glm47MoeToolParser(MockTokenizer(), tools=[AGENT_TOOL])
+
+    @pytest.fixture
+    def agent_request(self):
+        return MockRequest(tools=[AGENT_TOOL], tool_choice="auto")
+
+    def test_nonstreaming_agent_tool_call(self, agent_parser, agent_request):
+        """Non-streaming: parse Agent tool call with multiline prompt arg."""
+        result = agent_parser.extract_tool_calls(GLM5_REAL_OUTPUT, agent_request)
+        assert result.tools_called is True, f"tools_called=False, content={result.content!r}"
+        assert len(result.tool_calls) == 1
+        tc = result.tool_calls[0]
+        assert tc.function.name == "Agent"
+        args = json.loads(tc.function.arguments)
+        assert args["description"] == "Explore codebase architecture"
+        assert args["subagent_type"] == "Explore"
+        assert args["model"] == "sonnet"
+        assert "CLAUDE.md" in args["prompt"]
+
+    def _simulate_stream_by_chunks(self, parser, chunks, request):
+        results = []
+        accumulated = ""
+        for chunk in chunks:
+            prev = accumulated
+            accumulated += chunk
+            curr = accumulated
+            prev_ids = list(range(len(prev)))
+            curr_ids = list(range(len(curr)))
+            delta_ids = list(range(len(prev), len(curr)))
+            msg = parser.extract_tool_calls_streaming(
+                previous_text=prev,
+                current_text=curr,
+                delta_text=chunk,
+                previous_token_ids=prev_ids,
+                current_token_ids=curr_ids,
+                delta_token_ids=delta_ids,
+                request=request,
+            )
+            if msg is not None:
+                results.append(msg)
+        return results
+
+    def test_streaming_agent_tool_call(self, agent_request):
+        """Streaming: parse Agent tool call with multiline prompt arg."""
+        parser = Glm47MoeToolParser(MockTokenizer(), tools=[AGENT_TOOL])
+        # Feed the real model output in small chunks
+        text = GLM5_REAL_OUTPUT
+        chunk_size = 20
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+        results = self._simulate_stream_by_chunks(parser, chunks, agent_request)
+
+        # Should have content before tool call
+        content_msgs = [r for r in results if r.content]
+        assert len(content_msgs) > 0, "No content messages emitted"
+
+        # Should have tool call deltas
+        tool_msgs = [r for r in results if r.tool_calls]
+        assert len(tool_msgs) > 0, "No tool call messages emitted"
+
+        # Check function name
+        names = [
+            tc.function.name
+            for r in tool_msgs
+            for tc in r.tool_calls
+            if tc.function and tc.function.name
+        ]
+        assert "Agent" in names, f"Expected 'Agent' in names, got {names}"
+
+        # Reconstruct arguments from deltas
+        arg_parts = [
+            tc.function.arguments
+            for r in tool_msgs
+            for tc in r.tool_calls
+            if tc.function and tc.function.arguments
+        ]
+        combined_args = "".join(arg_parts)
+        assert combined_args, "No argument fragments emitted"
+        parsed = json.loads(combined_args)
+        assert parsed["description"] == "Explore codebase architecture"
+        assert parsed["subagent_type"] == "Explore"
+        assert parsed["model"] == "sonnet"
+        assert "CLAUDE.md" in parsed["prompt"]
+
+    def test_streaming_agent_tool_call_no_schema(self, agent_request):
+        """Streaming: Agent tool NOT in schema — all args go through non-string path."""
+        # Use tools list that does NOT contain Agent
+        parser = Glm47MoeToolParser(MockTokenizer(), tools=ALL_TOOLS)
+        text = GLM5_REAL_OUTPUT
+        chunk_size = 20
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+
+        results = self._simulate_stream_by_chunks(parser, chunks, agent_request)
+
+        tool_msgs = [r for r in results if r.tool_calls]
+        assert len(tool_msgs) > 0, "No tool call messages emitted"
+
+        names = [
+            tc.function.name
+            for r in tool_msgs
+            for tc in r.tool_calls
+            if tc.function and tc.function.name
+        ]
+        assert "Agent" in names, f"Expected 'Agent' in names, got {names}"
+
+        arg_parts = [
+            tc.function.arguments
+            for r in tool_msgs
+            for tc in r.tool_calls
+            if tc.function and tc.function.arguments
+        ]
+        combined_args = "".join(arg_parts)
+        assert combined_args, f"No argument fragments emitted"
+        parsed = json.loads(combined_args)
+        assert parsed["description"] == "Explore codebase architecture"
+        assert parsed["subagent_type"] == "Explore"
+        assert parsed["model"] == "sonnet"
+        assert "CLAUDE.md" in parsed["prompt"]
+
+    def test_nonstreaming_agent_tool_call_no_schema(self, agent_parser, agent_request):
+        """Non-streaming: Agent tool NOT in schema."""
+        parser = Glm47MoeToolParser(MockTokenizer(), tools=ALL_TOOLS)
+        result = parser.extract_tool_calls(GLM5_REAL_OUTPUT, agent_request)
+        assert result.tools_called is True
+        tc = result.tool_calls[0]
+        assert tc.function.name == "Agent"
+        args = json.loads(tc.function.arguments)
+        assert args["description"] == "Explore codebase architecture"
+        assert args["subagent_type"] == "Explore"
+        assert args["model"] == "sonnet"
 
 
 if __name__ == "__main__":

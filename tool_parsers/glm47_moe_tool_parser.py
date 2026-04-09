@@ -27,6 +27,8 @@ class Glm47MoeToolParser(Glm4MoeToolParser):
     only overriding the regex patterns to support GLM-4.7's more flexible format.
     """
 
+    supports_reasoning = False
+
     def __init__(self, tokenizer: Any, tools: list[dict] | None = None):
         super().__init__(tokenizer, tools)
         # GLM-4.7 format: <tool_call>func_name[<arg_key>...]*</tool_call>

@@ -630,6 +630,47 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
                             }
                         )
 
+            # Flush any remaining tool parser buffer after stream ends
+            # (e.g. </tool_call> was the last token and never got processed)
+            if use_tool_parser and req_parser:
+                content_text = req_parser.get_content_text(prev_text)
+                while True:
+                    flush_msg = req_parser.extract_tool_calls_streaming(
+                        previous_text=tool_prev_text,
+                        current_text=content_text,
+                        delta_text="",
+                        previous_token_ids=tool_prev_ids,
+                        current_token_ids=prev_ids,
+                        delta_token_ids=[],
+                        request=body,
+                    )
+                    if flush_msg is None:
+                        break
+                    flush_delta: Dict[str, Any] = {}
+                    if flush_msg.content:
+                        flush_delta["content"] = flush_msg.content
+                    if flush_msg.tool_calls:
+                        has_tool_calls = True
+                        flush_delta["tool_calls"] = [
+                            tc.model_dump(exclude_none=True) for tc in flush_msg.tool_calls
+                        ]
+                    if flush_delta:
+                        yield sse_format(
+                            {
+                                "id": cmpl_id,
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": body.model,
+                                "choices": [
+                                    {
+                                        "delta": flush_delta,
+                                        "index": 0,
+                                        "finish_reason": None,
+                                    }
+                                ],
+                            }
+                        )
+
             # Final chunk with finish_reason
             finish_reason = "tool_calls" if has_tool_calls else "stop"
             yield sse_format(
@@ -722,8 +763,8 @@ async def proxy_chat_completion(request: Request, body: OpenAIChatRequest):
                 tc.model_dump() for tc in extracted.tool_calls
             ]
 
-    # content_text_post = req_parser.post_process_content(message["content"])
-    # message["content"] = content_text_post
+    incoming_msgs = [m.model_dump() for m in body.messages]
+    agent = store.find_or_create_agent(incoming_msgs, body.tools)
     agent.append_turn(incoming_msgs, message, input_ids, output_ids, tool_ids)
     save_trajectory()
 
@@ -791,7 +832,7 @@ def parse_args():
         "--tool-parser",
         type=str,
         default=None,
-        choices=["qwen3_coder", "deepseek_v32"],
+        choices=["qwen3_coder", "deepseek_v32", "glm47", "kimi_k2"],
         help="Tool call parser to use for extracting tool calls from model output",
     )
     return parser.parse_args()
@@ -826,6 +867,14 @@ def init_globals(args):
         from tool_parsers.deepseekv32_tool_parser import DeepSeekV32ToolParser
         TOOL_PARSER = DeepSeekV32ToolParser(TOKENIZER)
         logger.info("Tool parser: DeepSeekV32ToolParser")
+    elif tool_parser_name == "glm47":
+        from tool_parsers.glm47_moe_tool_parser import Glm47MoeToolParser
+        TOOL_PARSER = Glm47MoeToolParser(TOKENIZER)
+        logger.info("Tool parser: Glm47MoeToolParser")
+    elif tool_parser_name == "kimi_k2":
+        from tool_parsers.kimi_k2_tool_parser import KimiK2ToolParser
+        TOOL_PARSER = KimiK2ToolParser(TOKENIZER)
+        logger.info("Tool parser: KimiK2ToolParser")
     else:
         logger.warning(f"Tool parser must be defined: {tool_parser_name=}")
         TOOL_PARSER = None
