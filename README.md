@@ -1,3 +1,7 @@
+# Relevant Documentation
+- [使用文档](./docs/usage.md)
+- [agent存储格式设计文档](./docs/agent_format.md)
+
 # Token-In-Token-Out Claude-Code Proxy Serving
 
 **The missing piece for Agentic RL training: a token-in, token-out proxy for SGLang.**

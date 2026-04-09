@@ -10,6 +10,9 @@ make clean
 mkdir -p ./log
 
 set -x
+
+litellm --config ./config/config.yaml --port 18080 2>&1 &
+
 python proxy_serving.py \
     --sglang-base-url ${SGLANG_BASE_URL} \
     --tokenizer-path ${MODEL_PATH} \
