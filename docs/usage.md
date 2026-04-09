@@ -40,17 +40,14 @@ make install
 最小化启动命令：
 
 ```bash
-python proxy_serving.py \
-    --sglang-base-url http://<SGLANG_HOST>:<SGLANG_PORT> \
-    --tokenizer-path /path/to/model \
-    --tool-parser qwen3_coder \
-    --host 0.0.0.0 \
-    --port 18901
+bash run_serving.sh
 ```
 
-启动后，客户端可以像使用 OpenAI API 一样访问 `http://<HOST>:18901/v1/chat/completions` 和 `http://<HOST>:18901/v1/completions`。
-
-完整的启动示例参见 `run_serving.sh`，其中还包含了 LiteLLM 网关的启动。
+本地Claude-Code配置：
+```bash
+export ANTHROPIC_AUTH_TOKEN=123
+export ANTHROPIC_BASE_URL=http://127.0.0.1:18080
+```
 
 ## 配置参数详解
 
