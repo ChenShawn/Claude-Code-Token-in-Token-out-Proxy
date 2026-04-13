@@ -132,8 +132,10 @@ class AgentTrajectory:
         self.response_mask: List[int] = []
 
         self.create_time = datetime.now().isoformat()
-        self.update_time = datetime.now().isoformat()
+        self.update_time = ""
+        self.finish_time = ""
         self.tools = input_tools
+        self.is_fresh = True
 
     def matches_prefix(self, incoming_messages: List[Dict[str, Any]]) -> bool:
         """Return True if self.messages is a non-empty prefix of incoming_messages."""
@@ -173,9 +175,11 @@ class AgentTrajectory:
         self.response_token_ids.extend(output_ids)
         self.response_mask.extend([0] * len(output_ids))
         self.update_time = datetime.now().isoformat()
+        self.is_fresh = True
 
     def to_jsonl_dict(self) -> Dict[str, Any]:
         """For JSONL export: agent_id + messages only, no token IDs."""
+        self.finish_time = datetime.now().isoformat()
         num_turns = _count_segments(self.response_mask)
         retdata = {
             "agent_id": self.agent_id,
@@ -188,10 +192,12 @@ class AgentTrajectory:
                 "total_agent_tokens": len(self.response_token_ids),
                 "create_time": self.create_time,
                 "update_time": self.update_time,
+                "finish_time": self.finish_time,
             }
         }
         if self.tools:
             retdata["tools"] = self.tools
+        self.is_fresh = False
         return retdata
 
     def to_parquet_dict(self, tokenizer=None) -> Dict[str, Any]:
@@ -207,6 +213,7 @@ class AgentTrajectory:
             response_text = tokenizer.decode(self.response_token_ids, skip_special_tokens=False)
             retdata["prompt_text"] = prompt_text
             retdata["response_text"] = response_text
+        self.is_fresh = False
         return retdata
 
 

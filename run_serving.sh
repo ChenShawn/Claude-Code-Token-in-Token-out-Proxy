@@ -12,6 +12,7 @@ TOOL_PARSER=glm47
 
 make clean
 mkdir -p ./log
+mkdir -p ./data
 
 set -x
 
