@@ -1,6 +1,7 @@
 # Relevant Documentation
 - [使用文档](./docs/usage.md)
 - [agent存储格式设计文档](./docs/agent_format.md)
+- [Docker image](https://hub.docker.com/repository/docker/chenshawn6915/claude-code-token-in-token-out-proxy/general)
 
 # Token-In-Token-Out Claude-Code Proxy Serving
 
