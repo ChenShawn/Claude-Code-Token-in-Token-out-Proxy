@@ -1,14 +1,20 @@
 #!/bin/bash
 
+# RUN pip install --no-cache litellm
+
 # MODEL_PATH=/diancpfs/user/fengyuan/backbones/DeepSeek-V3.2
 # MODEL_PATH=/diancpfs/user/fengyuan/backbones/Qwen/Qwen3.5-35B-A3B
-MODEL_PATH=/diancpfs/user/fengyuan/backbones/GLM-5.1
+# MODEL_PATH=/diancpfs/user/fengyuan/backbones/GLM-5.1
+MODEL_PATH=${LOCAL_MODEL_PATH}
+
 # SGLANG_BASE_URL=http://10.146.225.70:18901
-SGLANG_BASE_URL=http://10.146.236.83:30000
+# SGLANG_BASE_URL=http://10.146.236.83:30000
+SGLANG_BASE_URL=${SGLANG_TARGET_URL}
 
 # TOOL_PARSER=qwen3_coder
 # TOOL_PARSER=deepseek_v32
-TOOL_PARSER=glm47
+# TOOL_PARSER=glm47
+TOOL_PARSER=${TOOL_PARSER_NAME}
 
 make clean
 mkdir -p ./log

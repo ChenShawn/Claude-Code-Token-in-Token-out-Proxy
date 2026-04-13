@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y git
 RUN git clone https://github.com/ChenShawn/Claude-Code-Token-in-Token-out-Proxy.git /claude-proxy
 
 RUN pip install --no-cache -r /claude-proxy/requirements.txt
+RUN pip install 'litellm[proxy]'
 
 WORKDIR /claude-proxy
 
