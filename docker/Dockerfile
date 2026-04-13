@@ -9,6 +9,7 @@ RUN git clone https://github.com/ChenShawn/Claude-Code-Token-in-Token-out-Proxy.
 
 RUN pip install --no-cache -r /claude-proxy/requirements.txt
 RUN pip install 'litellm[proxy]'
+RUN pip install pyarrow --break-system-packages
 
 WORKDIR /claude-proxy
 
