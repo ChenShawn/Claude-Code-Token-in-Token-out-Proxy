@@ -1,0 +1,17 @@
+model_list:
+  - model_name: claude-*
+    litellm_params:
+      model: hosted_vllm/glm51
+      api_base: http://localhost:18901/v1
+      api_key: ""
+    model_info:
+      max_tokens: 202752
+      max_input_tokens: 202752
+      max_output_tokens: 131072
+
+litellm_settings:
+  drop_params: true
+  modify_params: true
+
+general_settings:
+  disable_key_check: true

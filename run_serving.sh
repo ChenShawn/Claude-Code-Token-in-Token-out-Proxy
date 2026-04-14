@@ -16,13 +16,13 @@ SGLANG_BASE_URL=${SGLANG_TARGET_URL}
 # TOOL_PARSER=glm47
 TOOL_PARSER=${TOOL_PARSER_NAME}
 
-make clean
+LITE_CONFIG=${LITE_CONFIG_PATH:-"./config/config.yaml"}
+
 mkdir -p ./log
 mkdir -p ./data
 
 set -x
-
-litellm --config ./config/config.yaml --port 18080 2>&1 &
+litellm --config ${LITE_CONFIG} --port 18080 2>&1 &
 
 python proxy_serving.py \
     --sglang-base-url ${SGLANG_BASE_URL} \
