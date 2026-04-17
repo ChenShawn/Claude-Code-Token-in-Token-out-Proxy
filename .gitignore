@@ -35,3 +35,6 @@ log/
 
 # Dependencies
 vllm/
+
+# xhs internal -- DO NOT PUSH TO github
+docker_runway/

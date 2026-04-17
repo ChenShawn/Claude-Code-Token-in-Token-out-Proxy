@@ -37,7 +37,7 @@ app = FastAPI(title="Anthropic-compatible LLM Gateway", redirect_slashes=False)
 
 # ── Configuration (all from env) ─────────────────────────────────────────
 
-UPSTREAM_TYPE = os.environ.get("UPSTREAM_TYPE", "aws").lower()  # "aws" or "google"
+UPSTREAM_TYPE = os.environ.get("UPSTREAM_TYPE", "google").lower()  # "aws" or "google"
 
 # Bedrock config
 BEDROCK_BASE = os.environ.get(
@@ -61,7 +61,7 @@ GOOGLE_ANTHROPIC_VERSION = "vertex-2023-10-16"
 UPSTREAM_API_KEY = os.environ.get("UPSTREAM_API_KEY", "")
 
 SAVE_DIR = os.environ.get("SAVE_DIR", "/data/logs")
-SAVE_ALL_REQUESTS = os.environ.get("SAVE_ALL_REQUESTS", "").lower() in ("1", "true", "yes")
+SAVE_ALL_REQUESTS = os.environ.get("SAVE_ALL_REQUESTS", "1").lower() in ("1", "true", "yes")
 
 _HOP_BY_HOP_HEADERS = frozenset({
     "transfer-encoding", "content-encoding", "connection",
@@ -362,6 +362,7 @@ async def _save_request_async(body: dict, stream: bool, status_code: int,
     token_dir = token or "unknown"
     ts = datetime.now().strftime("%Y%m%d_%H%M%S") + f"_{int(time.time() * 1000) % 1000:03d}"
 
+    """
     # ── 1. Raw format (unchanged) ──
     raw_path = os.path.join(SAVE_DIR, "raw", token_dir, f"request_{ts}.json")
     raw_payload = {
@@ -382,6 +383,7 @@ async def _save_request_async(body: dict, stream: bool, status_code: int,
     if status_code != 200:
         out_preview = str(output)[:500] if output is not None else ""
         print(f"[non-200] stream={stream} status={status_code}, body={out_preview}")
+    """
 
     # ── 2. Trajectory format (only for successful requests with messages) ──
     if status_code == 200 and isinstance(body, dict) and "messages" in body:
@@ -398,7 +400,8 @@ async def _save_request_async(body: dict, stream: bool, status_code: int,
             agent = store.find_or_create_agent(messages, tools)
             agent.append_turn(messages, assistant_msg)
 
-            traj_path = os.path.join(SAVE_DIR, "trajectory", token_dir, "trajectory.jsonl")
+            traj_id = store.traj_id
+            traj_path = os.path.join(SAVE_DIR, f"{traj_id}.jsonl")
 
             def _write_traj():
                 store.save_jsonl(traj_path)
